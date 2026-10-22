@@ -1,0 +1,25 @@
+# ---- 个人数据：绝对不能上传 ----
+*.json
+*.py
+*.pyc
+__pycache__/
+*.jks
+*.keystore
+browser_profile/
+*.log
+*.zip
+
+# ---- 构建产物 / 依赖 ----
+node_modules/
+dist/
+build/
+.gradle/
+.gradle-cache/
+*.idsig
+
+# ---- 系统与编辑器 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
