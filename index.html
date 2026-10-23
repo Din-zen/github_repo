@@ -170,6 +170,15 @@ h3.sec{margin:2px 0 8px;font-size:11px;letter-spacing:.6px;color:var(--dim);font
 .mini .m-loc{margin-top:3px;font-size:9.5px;color:#9fb0c8;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mini.live{border-color:rgba(94,234,212,.65);box-shadow:0 6px 18px rgba(94,234,212,.25),0 0 0 1px rgba(94,234,212,.35)}
+.extras{margin-top:16px}
+.extras .ex-head{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px;color:var(--muted)}
+.extras .ex-head b{color:var(--text);font-size:13px}
+.extras .ex-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;
+  background:var(--glass);border:1px solid var(--line);margin-bottom:6px}
+.extras .ex-name{flex:1;min-width:0;font-size:12.5px;font-weight:600;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.extras .ex-week{font-size:10.5px;color:var(--dim);white-space:nowrap}
+.extras .ex-teacher{font-size:10.5px;color:var(--muted);white-space:nowrap}
 .board-empty{margin:8px 0 18px;padding:30px 18px;border-radius:18px;text-align:center;
   border:1px dashed rgba(255,255,255,.14);background:rgba(255,255,255,.03)}
 .board-empty .be-icon{font-size:34px;opacity:.8}
@@ -418,6 +427,7 @@ body.sheet-open .fab{opacity:0;pointer-events:none;transform:translateY(10px)}
       <div class="day-summary" id="daySummary"></div>
       <div class="timeline" id="timeline"></div>
     </section>
+    <div class="extras" id="extrasBox" hidden></div>
     <p class="board-hint" id="boardHint">左右滑动查看全周 · 点课程可以微调</p>
   </main>
 </div>
@@ -629,20 +639,32 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
 <script>
 /* ===== pdf-import.js ===== */
 /* ============================================================
- * pdf-import.js — 教务系统课表 PDF 解析（纯前端，pdf.js 3.x）
- * A 列表版：按星期分块，行内 “1-2 课程★ 周数:…/校区:…/地点:…/教师:…”
- * B 表格版：表头 “节次 星期一…星期日”，格子内 “课程★ (1-2节)…/场地:…/教师:…”
- * 关键：教务 PDF 常整页旋转 90°，必须先经 viewport 换算坐标；
- *       中文字体需要 CMap，否则一个字都取不到。
+ * pdf-import.js — 通用课表 PDF 解析引擎（v3.1.4）
+ * ------------------------------------------------------------
+ * 设计来源（不是针对某个文件写正则）：
+ *   · Camelot 的 “stream” 思路：无表格线时，用文字的空白间隙推断列
+ *   · XY-cut 版面分析：递归按空白缝切分页面
+ *   · 文本行聚类：按 y 自适应容差聚行（参考 pdfplumber / PDF.js 的常用做法）
+ *
+ * 流程（全部基于坐标，不依赖固定排版）：
+ *   1. 取字（屏幕坐标：view.js 的 viewport 变换，处理旋转页）
+ *   2. 自适应 y 容差聚成“行”
+ *   3. 判版面：
+ *        a) 有表头（一行里 ≥3 个星期名）      → 按表头 x 锚点切列
+ *        b) 有散落的“星期X”标签                → 按标签 y 就近分块
+ *        c) 都没有                              → 用 x 直方图空白缝推断列
+ *   4. 每个“列 × 行”单元里，用锚点（周次/节次）把文字流切成课程块
+ *   5. 块内抽字段：周次、节次、教师、地点、课程名；没有节次/地点的进“其他课程”
  * ============================================================ */
 (function (global) {
   "use strict";
 
-  var DAY_MAP = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7 };
-  var SYMBOL_RE = /[★☆○●◇◆◎]/;
-  var WEEK_RE = /(\d{1,2}-\d{1,2}周(?:[(（][单双][)）])?)/;
+  var DAY_CHARS = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7 };
+  var DAY_LABEL_RE = /^(?:星期|周|礼拜)([一二三四五六日天])$/;
+  var SYMBOL_RE = /[★☆○●◇◆◎◆]/;
+  var CJK_RE = /[\u4e00-\u9fa5]/;
 
-  /* ---------- 离线初始化：Blob Worker + 内联 CMap ---------- */
+  /* ================= pdf.js 初始化 ================= */
   var workerUrl = null, pdfReady = false;
 
   function initPdfEngine() {
@@ -655,12 +677,8 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
         var bytes = new Uint8Array(bin.length);
         for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         workerUrl = URL.createObjectURL(new Blob([bytes], { type: "text/javascript" }));
-        // 关键：直接建 Worker 并交给 pdf.js。
-        // 若只设 workerSrc，pdf.js 在 file://（origin=null）下会再包一层 blob 去 importScripts，
-        // 被浏览器安全策略拦截；用 workerPort 可以完全跳过这一步。
         try {
-          var worker = new Worker(workerUrl);
-          global.pdfjsLib.GlobalWorkerOptions.workerPort = worker;
+          global.pdfjsLib.GlobalWorkerOptions.workerPort = new Worker(workerUrl);
         } catch (e) {
           global.pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
         }
@@ -683,43 +701,6 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
     return Promise.resolve({ cMapData: bytes, compressionType: 1 });
   };
 
-  function clean(v) {
-    return String(v == null ? "" : v)
-      .replace(/[\u200b-\u200f\ufeff]/g, "")
-      .replace(/\u00a0/g, " ")
-      .replace(/[ \t]+/g, " ")
-      .trim();
-  }
-
-  function isNoise(text) {
-    if (!text) return true;
-    if (text.indexOf("打印时间") >= 0) return true;
-    if (/^[★☆○●◇◆◎][:：]/.test(text)) return true;
-    return false;
-  }
-
-  function parseWeeks(text) {
-    if (!text) return [];
-    var raw = String(text).replace(/第/g, "").replace(/周/g, "");
-    var weeks = [], seen = {};
-    raw.split(/[,，、;；\/]+/).forEach(function (seg) {
-      seg = seg.trim();
-      if (!seg) return;
-      var odd = seg.indexOf("单") >= 0, even = seg.indexOf("双") >= 0;
-      var digits = seg.replace(/[^0-9\-~—]/g, "");
-      var m = digits.match(/^(\d+)(?:[-~—](\d+))?$/);
-      if (!m) return;
-      var a = parseInt(m[1], 10), b = parseInt(m[2] || m[1], 10);
-      if (b < a) { var t = a; a = b; b = t; }
-      for (var w = a; w <= b; w++) {
-        if (odd && w % 2 === 0) continue;
-        if (even && w % 2 === 1) continue;
-        if (!seen[w]) { seen[w] = 1; weeks.push(w); }
-      }
-    });
-    return weeks.sort(function (x, y) { return x - y; });
-  }
-
   async function extractPages(file) {
     var buffer = await file.arrayBuffer();
     initPdfEngine();
@@ -727,6 +708,7 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
       data: buffer, isEvalSupported: false, useSystemFonts: true,
       CMapReaderFactory: InlineCMapReaderFactory, cMapPacked: true
     }).promise;
+
     var pages = [];
     for (var i = 1; i <= doc.numPages; i++) {
       var page = await doc.getPage(i);
@@ -734,269 +716,1079 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
       var viewport = page.getViewport({ scale: 1 });
       var items = [];
       content.items.forEach(function (it) {
-        var s = clean(it.str);
+        var s = String(it.str || "").replace(/[\u200b-\u200f\ufeff]/g, "").replace(/\u00a0/g, " ").trim();
         if (!s) return;
         var tx = global.pdfjsLib.Util.transform(viewport.transform, it.transform);
-        items.push({ s: s, x: tx[4], y: -tx[5], w: (it.width || 0) * viewport.scale });
+        items.push({
+          s: s,
+          x: tx[4],
+          y: -tx[5],
+          w: (it.width || 0) * viewport.scale,
+          h: Math.abs(tx[3]) || (it.height || 10) * viewport.scale
+        });
       });
       pages.push({ items: items, width: viewport.width, height: viewport.height });
     }
     return pages;
   }
 
-  function clusterRows(items, tol) {
-    tol = tol || 6;
-    var sorted = items.slice().sort(function (a, b) { return (b.y - a.y) || (a.x - b.x); });
-    var rows = [], cur = null;
-    sorted.forEach(function (it) {
-      if (!cur || Math.abs(cur.y - it.y) > tol) {
-        cur = { y: it.y, items: [it] };
-        rows.push(cur);
-      } else {
-        cur.items.push(it);
-        cur.y = (cur.y * cur.items.length + it.y) / (cur.items.length + 1);
+  /* ================= 文本工具 ================= */
+  function norm(s) { return String(s || "").replace(/\s+/g, ""); }
+  function hasCJK(s) { return CJK_RE.test(s); }
+
+  // “1-3周,6-14周” / “第1-16周” / “1-15周(单)”
+  function weekTokens(text) {
+    var out = [];
+    var re = /(?:第)?\s*(\d{1,2})\s*(?:[-–—~至]\s*(\d{1,2}))?\s*周(?!数|次|学时)\s*(?:\(?\s*([单双])\s*\)?)?/g;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+      // 排除 “周一/周三” 这类星期词
+      var after = text.slice(m.index + m[0].length);
+      if (/^[一二三四五六日天]/.test(after)) continue;
+      var a = parseInt(m[1], 10);
+      var b = parseInt(m[2] || m[1], 10);
+      var odd = m[3] === "单", even = m[3] === "双";
+      var weeks = [];
+      for (var w = Math.min(a, b); w <= Math.max(a, b); w++) {
+        if (odd && w % 2 === 0) continue;
+        if (even && w % 2 === 1) continue;
+        weeks.push(w);
       }
+      if (!weeks.length) continue;
+      out.push({ raw: m[0].replace(/\s+/g, ""), weeks: weeks, parity: m[3] || "", index: m.index });
+    }
+    return out;
+  }
+
+  // 只保留“相邻”的周次 token（逗号分隔属于同一段），跨句/跨字段的一律不合并
+  function primaryWeekTokens(tokens) {
+    if (!tokens.length) return [];
+    var groups = [[tokens[0]]];
+    for (var i = 1; i < tokens.length; i++) {
+      var prev = tokens[i - 1], cur = tokens[i];
+      var gap = cur.index - (prev.index + prev.raw.length);
+      if (gap >= 0 && gap <= 6) groups[groups.length - 1].push(cur);
+      else groups.push([cur]);
+    }
+    return groups[0];
+  }
+
+  // 周次来源优先级：周数/周次 字段值 → 文本中第一段相邻周次
+  function weeksFromText(text) {
+    var m = text.match(/(?:周数|周次)\s*[:：]\s*([^/]+)/);
+    if (m) {
+      var toks = weekTokens(m[1]);
+      if (toks.length) return primaryWeekTokens(toks);
+    }
+    return primaryWeekTokens(weekTokens(text));
+  }
+
+  // 把多个周次 token 合并成规范文本：去冗余、合并连续区间、保留单双周
+  function canonicalWeeks(tokens) {
+    var set = {}, parity = "", allParity = tokens.length > 0;
+    tokens.forEach(function (t) {
+      t.weeks.forEach(function (w) { set[w] = 1; });
+      if (t.parity) {
+        if (!parity) parity = t.parity;
+        else if (parity !== t.parity) allParity = false;
+      } else allParity = false;
     });
-    rows.forEach(function (r) {
-      r.items.sort(function (a, b) { return (a.x - b.x) || (b.y - a.y); });
-      r.text = r.items.map(function (it) { return it.s; }).join("");
-    });
-    return rows;
+    var list = Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
+    if (!list.length) return { text: "", list: [] };
+
+    // 隔周课程（1,3,5…）压缩成 “1-15周(单)”
+    if (list.length >= 2) {
+      var steps = {};
+      for (var k = 1; k < list.length; k++) steps[list[k] - list[k - 1]] = 1;
+      var keys = Object.keys(steps);
+      if (keys.length === 1 && keys[0] === "2") {
+        var par = list[0] % 2 === 1 ? "单" : "双";
+        return { text: list[0] + "-" + list[list.length - 1] + "周(" + par + ")", list: list };
+      }
+    }
+
+    var parts = [], i = 0;
+    while (i < list.length) {
+      var j = i;
+      while (j + 1 < list.length && list[j + 1] === list[j] + 1) j++;
+      parts.push(j === i ? list[i] + "周" : list[i] + "-" + list[j] + "周");
+      i = j + 1;
+    }
+    var text = parts.join(",");
+    if (allParity && parity) text += "(" + parity + ")";
+    return { text: text, list: list };
+  }
+
+  // “1-2节” / “(1-4节)” / “第3-4节”
+  function periodTokens(text) {
+    var out = [];
+    var re = /(?:第)?\s*\(?\s*(\d{1,2})\s*[-–—~至]\s*(\d{1,2})\s*\)?\s*节\s*\)?/g;
+    var m;
+    while ((m = re.exec(text)) !== null) {
+      var a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+      if (a < 1 || b > 12 || b < a) continue;
+      out.push({ start: a, end: b, raw: m[0].replace(/\s+/g, ""), index: m.index });
+    }
+    return out;
+  }
+
+  function periodsIn(text) {
+    var ps = periodTokens(text);
+    if (ps.length) return ps;
+    var lead = text.match(/^\s*(\d{1,2})\s*[-–—~至]\s*(\d{1,2})\s+(?=[\u4e00-\u9fa5A-Za-z])/);
+    if (lead) {
+      var a = parseInt(lead[1], 10), b = parseInt(lead[2], 10);
+      if (a >= 1 && b <= 12 && b >= a) return [{ start: a, end: b, raw: lead[0].trim() }];
+    }
+    return [];
   }
 
   function pickField(text, names) {
     for (var i = 0; i < names.length; i++) {
-      var m = text.match(new RegExp("(?:" + names[i] + ")[:：]\\s*([^/]*)"));
-      if (m && m[1]) return clean(m[1]).replace(/[:：]$/, "");
+      var m = text.match(new RegExp("(?:" + names[i] + ")\\s*[:：]\\s*([^/]+)"));
+      if (!m || !m[1]) continue;
+      var v = m[1]
+        .split(/(?:周数|周次|教师|老师|地点|场地|教室|校区|教学班|学分|学时|考核方式|选课备注|课程代码|备注|停课|调课|补课)/)[0]
+        .trim();
+      // 括号没闭合（文字被换行截断）时裁掉半个括号
+      if (/[（(]/.test(v) && !/[）)]/.test(v)) v = v.split(/[（(]/)[0].trim();
+      if (v) return v.replace(/[:：]$/, "").trim();
     }
     return "";
   }
 
-  function periodsFromText(text) {
-    var m = text.match(/\((\d{1,2})-(\d{1,2})节\)/);
-    return m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : null;
+  function isDayLabel(s) {
+    var t = norm(s);
+    if (DAY_LABEL_RE.test(t)) return DAY_LABEL_RE.exec(t)[1];
+    return null;
   }
 
-  function buildCourse(raw) {
-    var weeks = clean(raw.weeks || "");
-    var p = raw.periods || [raw.start, raw.end];
-    var start = parseInt(p[0], 10) || 0, end = parseInt(p[1], 10) || start;
-    var name = cleanName(raw.name || "");
-    if (!name || !start || !end) return null;
-    if (name.length > 24 || /[\/:：]/.test(name)) return null;
-    return {
-      name: name, teacher: clean(raw.teacher || ""), location: clean(raw.location || ""),
-      day: raw.day, start_period: start, end_period: end,
-      periods: start + "-" + end, weeks: weeks, week_list: parseWeeks(weeks)
-    };
+  /* ================= 行聚类（自适应容差） ================= */
+  function median(nums) {
+    if (!nums.length) return 0;
+    var a = nums.slice().sort(function (x, y) { return x - y; });
+    return a[Math.floor(a.length / 2)];
   }
 
-  function collectMeta(pages) {
-    var meta = {}, text = "";
-    pages.forEach(function (pg) { pg.items.forEach(function (it) { text += it.s; }); });
-    var sem = text.match(/(\d{4}-\d{4})学年第(\S{1,2})学期/);
-    if (sem) meta.semester = sem[1] + " 学年 第 " + sem[2] + " 学期";
-    var sid = text.match(/学号[:：](\d+)/);
-    if (sid) meta.student_id = sid[1];
-    var who = text.match(/^([^\s:：]{1,10})课表/);
-    if (who) meta.student_name = who[1];
-    return meta;
-  }
-
-  /* ---------- 字段清洗 ---------- */
-  function cleanName(text) {
-    var s = String(text || "");
-    var slash = s.lastIndexOf("/");
-    if (slash >= 0) s = s.slice(slash + 1);
-    s = s.replace(/^.*?(?:学分|总学时|周学时|学时|考核方式|选课备注|教学班组成)[:：][0-9.]*/, "");
-    s = s.replace(/^[0-9\-]+\s*/, "").replace(/^[:：\s]+/, "").trim();
-    return s;
-  }
-
-  /* ---------- A. 列表版：按“最近的星期表头”分块 ---------- */
-  function parseList(pages) {
-    var courses = [];
-    pages.forEach(function (pg) {
-      var headers = [];
-      pg.items.forEach(function (it) {
-        var t = it.s.replace(/\s+/g, "");
-        var m = t.match(/^星期([一二三四五六日天])$/);
-        if (m) headers.push({ day: DAY_MAP[m[1]], y: it.y });
-      });
-      if (!headers.length) return;
-      headers.sort(function (a, b) { return a.y - b.y; });
-
-      var buckets = headers.map(function (h) { return { day: h.day, y: h.y, items: [] }; });
-      pg.items.forEach(function (it) {
-        if (/^星期[一二三四五六日天]$/.test(it.s.replace(/\s+/g, ""))) return;
-        if (isNoise(it.s)) return;
-        var best = null, bestD = Infinity;
-        buckets.forEach(function (b) {
-          var d = Math.abs(b.y - it.y);
-          if (d < bestD) { bestD = d; best = b; }
-        });
-        if (best && bestD <= 85) best.items.push(it);
-      });
-
-      buckets.forEach(function (bucket) {
-        if (!bucket.items.length) return;
-        var rows = clusterRows(bucket.items, 6);
-
-        // 节次行：可能独占一行（"9-10"），也可能与详情粘连（"3-4周数:…"）
-        var periodRows = [];
-        rows.forEach(function (r) {
-          var t = r.text.replace(/\s+/g, "");
-          var m = t.match(/^(\d{1,2})-(\d{1,2})/);
-          if (m) {
-            var s1 = parseInt(m[1], 10), e1 = parseInt(m[2], 10);
-            // 只认 1-2 ... 11-12 这种节次，别把 1-16周 当成节次
-            if (s1 >= 1 && e1 <= 12 && e1 > s1) {
-              periodRows.push({ y: r.y, start: s1, end: e1 });
-            }
-          }
-        });
-
-        rows.forEach(function (r) {
-          var t = r.text.replace(/\s+/g, "");
-          var sym = t.search(SYMBOL_RE);
-          if (sym <= 0) return;
-
-          var head = t.slice(0, sym);
-          var tail = t.slice(sym + 1);
-          var periods = null;
-          var name = cleanName(head);
-
-          // 详情可能被拆到上下相邻的行（节次行夹在中间），补回来
-          if (!WEEK_RE.test(tail)) {
-            rows.forEach(function (r2) {
-              if (r2 === r) return;
-              if (Math.abs(r2.y - r.y) > 14) return;
-              if (SYMBOL_RE.test(r2.text)) return;
-              if (/^(\d{1,2})-(\d{1,2})$/.test(r2.text.replace(/\s+/g, ""))) return;
-              tail += r2.text;
-            });
-          }
-
-          var lead = head.match(/^(\d{1,2})-(\d{1,2})(.*)$/);
-          if (lead) {
-            periods = [parseInt(lead[1], 10), parseInt(lead[2], 10)];
-            name = cleanName(lead[3]);
-          }
-          if (!periods) {
-            var near = null, nd = Infinity;
-            periodRows.forEach(function (p) {
-              var d = Math.abs(p.y - r.y);
-              if (d < nd) { nd = d; near = p; }
-            });
-            if (near && nd <= 40) periods = [near.start, near.end];
-          }
-          if (!periods) return;
-
-          var course = buildCourse({
-            name: name, day: bucket.day, periods: periods,
-            weeks: (tail.match(/周数[:：]\s*([0-9\-~—]+周(?:[(（][单双][)）])?)/) || [])[1]
-                   || (tail.match(WEEK_RE) || [])[1] || "",
-            location: pickField(tail, ["地点", "场地", "教室"]),
-            teacher: pickField(tail, ["教师", "老师"])
-          });
-          if (course) courses.push(course);
-        });
-      });
+  function buildLines(items) {
+    var tol = Math.max(2.5, median(items.map(function (i) { return i.h || 10; })) * 0.5);
+    var sorted = items.slice().sort(function (a, b) { return (b.y - a.y) || (a.x - b.x); });
+    var lines = [], cur = null;
+    sorted.forEach(function (it) {
+      if (!cur || Math.abs(cur.y - it.y) > tol) {
+        cur = { y: it.y, items: [it] };
+        lines.push(cur);
+      } else {
+        cur.items.push(it);
+        cur.y = (cur.y * (cur.items.length - 1) + it.y) / cur.items.length;
+      }
     });
-    return { courses: courses, meta: collectMeta(pages) };
+    lines.forEach(function (ln) {
+      ln.items.sort(function (a, b) { return a.x - b.x; });
+      ln.text = ln.items.map(function (i) { return i.s; }).join(" ");
+      ln.x = ln.items[0].x;
+      ln.x2 = ln.items[ln.items.length - 1].x + (ln.items[ln.items.length - 1].w || 0);
+    });
+    return lines;
   }
 
-  /* ---------- B. 表格版：先按列切行，再把“名称行 + 后续详情行”拼成单元格 ---------- */
-  function findHeaderRow(pages) {
-    for (var p = 0; p < pages.length; p++) {
-      var rows = clusterRows(pages[p].items, 6);
-      for (var r = 0; r < rows.length; r++) {
-        var t = rows[r].text.replace(/\s+/g, "");
-        if (t.indexOf("节次") >= 0 && (t.match(/星期[一二三四五六日天]/g) || []).length >= 2) {
-          return { page: p, row: rows[r] };
-        }
+  /* ================= 版面判定 ================= */
+  function findHeaderAnchor(lines) {
+    for (var i = 0; i < lines.length; i++) {
+      var found = [];
+      lines[i].items.forEach(function (it) {
+        var d = norm(it.s).match(/星期([一二三四五六日天])/);
+        if (d) found.push({ day: DAY_CHARS[d[1]], x: it.x + (it.w || 0) / 2 });
+      });
+      if (found.length >= 3) {
+        var days = {};
+        var list = [];
+        found.forEach(function (f) {
+          if (days[f.day]) return;
+          days[f.day] = 1;
+          list.push(f);
+        });
+        list.sort(function (a, b) { return a.x - b.x; });
+        return { line: lines[i], anchors: list };
       }
     }
     return null;
   }
 
-  function isTableLayout(pages) { return !!findHeaderRow(pages); }
-
-  function parseTable(pages) {
-    var header = findHeaderRow(pages);
-    if (!header) return null;
-
-    var days = [], periodItem = null;
-    header.row.items.forEach(function (it) {
-      var m = it.s.match(/星期([一二三四五六日天])/);
-      if (m) days.push({ day: DAY_MAP[m[1]], x: it.x });
-      if (!periodItem && it.s.indexOf("节次") >= 0) periodItem = it;
+  function findDayLabels(lines) {
+    var labels = [];
+    lines.forEach(function (ln) {
+      ln.items.forEach(function (it) {
+        var d = isDayLabel(it.s);
+        if (d) labels.push({ day: DAY_CHARS[d], y: ln.y, x: it.x });
+      });
     });
-    if (days.length < 5) return null;
-    days.sort(function (a, b) { return a.x - b.x; });
+    return labels.length >= 1 ? labels : null;
+  }
 
-    var periodX = periodItem ? periodItem.x : days[0].x - 80;
-    var bounds = days.map(function (d, idx) {
-      var left = idx === 0 ? (periodX + d.x) / 2 : (days[idx - 1].x + d.x) / 2;
-      var right = idx === days.length - 1 ? Infinity : (d.x + days[idx + 1].x) / 2;
-      return { day: d.day, left: left, right: right };
+  // 用“行首 x”的空白缝推断列（XY-cut 的一维版本）
+  // 注意：必须用行的起点，不能用字的中心——同一列里名字行和详情行宽度不同，
+  // 用中心会把一列劈成两列。
+  function inferColumns(items, pageWidth) {
+    var xs = items.map(function (i) { return i.x; })
+      .filter(function (v) { return isFinite(v); })
+      .sort(function (a, b) { return a - b; });
+    if (xs.length < 4) return null;
+    var gapT = Math.max(36, (pageWidth || 600) * 0.055);
+    var clusters = [], start = xs[0], prev = xs[0];
+    for (var i = 1; i < xs.length; i++) {
+      if (xs[i] - prev > gapT) {
+        clusters.push({ from: start, to: prev });
+        start = xs[i];
+      }
+      prev = xs[i];
+    }
+    clusters.push({ from: start, to: prev });
+    clusters = clusters.filter(function (c) { return c.to - c.from >= 0; });
+    return clusters.length >= 2 ? clusters : null;
+  }
+
+  function columnBounds(clusters) {
+    var bounds = [];
+    for (var i = 0; i < clusters.length; i++) {
+      var left = i === 0 ? -Infinity : (clusters[i - 1].to + clusters[i].from) / 2;
+      var right = i === clusters.length - 1 ? Infinity : (clusters[i].to + clusters[i + 1].from) / 2;
+      bounds.push({ left: left, right: right, center: (clusters[i].from + clusters[i].to) / 2 });
+    }
+    return bounds;
+  }
+
+  /* ================= 单元 → 课程块 ================= */
+  function isFieldOnly(t) {
+    var stripped = t
+      .replace(/(?:教师|老师|任课教师|授课教师|地点|场地|教室|上课地点|上课教室|校区|教学班|周数|周次|学分|学时|考核方式|选课备注|课程代码|备注)\s*[:：][^/]*/g, "")
+      .replace(/(?:第)?\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*周\s*(?:\(?\s*[单双]\s*\)?)?/g, "")
+      .replace(/(?:第)?\s*\(?\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*\)?\s*节/g, "")
+      .replace(SYMBOL_RE, "")
+      .replace(/[\s:：/·•\-–—,，;；、()（）]+/g, "");
+    return stripped.length < 2 || !hasCJK(stripped);
+  }
+
+  /* ---------- 文本归一化：去掉汉字之间的空格（PDF 抽字会拆开） ---------- */
+  function tighten(text) {
+    return String(text || "")
+      // 汉字与汉字、汉字与全角标点、全角标点之间不留空格
+      .replace(/([\u4e00-\u9fa5\u3000-\u303f\uff01-\uff65])\s+(?=[\u4e00-\u9fa5\u3000-\u303f\uff01-\uff65])/g, "$1")
+      .replace(/\s*([:：/])\s*/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  var FIELD_LABEL_RE = /(周数|周次|教师|老师|任课教师|授课教师|地点|场地|教室|校区|教学班|教学班组成|选课备注|学分|学时|考核方式|课程代码|课程学时组成)/;
+
+  function hasFieldLabel(t) { return FIELD_LABEL_RE.test(t); }
+
+  function isPureName(t) {
+    var x = tighten(t);
+    if (!x || x.length > 30) return false;
+    if (hasFieldLabel(x)) return false;
+    if (weekTokens(x).length) return false;
+    if (periodsIn(x).length) return false;
+    return (x.match(/[\u4e00-\u9fa5]/g) || []).length >= 2;
+  }
+
+  /* ---------- 行 → 课程块 ----------
+   * 不再“有周次就切块”，而是按节次（周期）归属：
+   *   · 已经拿到节次的块，遇到“纯课名”行 → 新课开始（表格版：课名在详情上一行）
+   *   · 还没拿到节次的块，遇到带节次的行 → 若块里只有一行纯课名，则合并（同一门课的两行）
+   *   · 字段行（周数/地点/学时…）永远并入当前块
+   */
+  function rowsToBlocks(lines) {
+    var blocks = [], cur = null;
+
+    function startBlock() {
+      cur = { parts: [], hasPeriod: false, lines: 0 };
+      blocks.push(cur);
+    }
+    function info(text) {
+      var t = tighten(text);
+      return { p: periodsIn(t).length > 0, pure: isPureName(t) };
+    }
+
+    lines.forEach(function (ln, idx) {
+      var t = tighten(ln.text);
+      if (!t) return;
+      var contLine = /^[:：;；\/]/.test(t) ||
+        /教学班组成|教学班|考核方式|选课备注|课程学时组成/.test(t);
+      if (!cur) { startBlock(); cur.parts.push(t); cur.lines = 1; cur.hasPeriod = info(t).p; return; }
+
+      var f = info(t);
+      f.nameish = !contLine && !isFieldOnly(t);
+      var curText = tighten(cur.parts.join(" "));
+      // “纯名字块”：还没有节次、也没有字段标签的块（课名可能被换行拆成多行）
+      var curPure = !cur.hasPeriod && !hasFieldLabel(curText);
+      var curHasWeek = weekTokens(curText).length > 0;
+
+      var newBlock = false;
+      if (!f.nameish && cur) {
+        // 字段续行（以 : / ; 开头，或含教学班/考核方式等）永远并入当前块
+        cur.parts.push(t); cur.lines++; if (f.p) cur.hasPeriod = true;
+        return;
+      }
+      if (f.p && cur.hasPeriod) {
+        // 当前块已有节次：
+        //   · 本行还带字段标签（周数/地点/教师…）且当前块还没周次 → 这是同一门课的详情行
+        //   · 否则 → 下一门课
+        newBlock = !(hasFieldLabel(t) && !curHasWeek);
+      } else if (!f.p && f.pure && cur.hasPeriod && !contLine) {
+        newBlock = true;                                            // 表格版：下一门课的名字
+      } else if (f.p && !cur.hasPeriod && !curPure) {
+        newBlock = true;                                            // 当前块是杂项，这行开新课
+      }
+
+      if (newBlock) startBlock();
+      cur.parts.push(t);
+      cur.lines++;
+      if (f.p) cur.hasPeriod = true;
     });
 
-    var columns = {};
-    pages.forEach(function (pg, pageIndex) {
-      clusterRows(pg.items, 6).forEach(function (row) {
-        // 表头及其上方（标题、姓名）不参与
-        if (pageIndex === header.page && row.y >= header.row.y - 1) return;
-        var groups = {};
-        row.items.forEach(function (it) {
-          if (isNoise(it.s)) return;
-          var cx = it.x + (it.w || 0) / 2;
-          for (var b = 0; b < bounds.length; b++) {
-            if (cx >= bounds[b].left && cx < bounds[b].right) {
-              (groups[bounds[b].day] = groups[bounds[b].day] || []).push(it);
-              break;
-            }
+    return blocks;
+  }
+
+  var LABEL_WORDS = /(教学班组成|教学班|选课备注|课程学时组成|课程代码|考核方式|周学时|总学时|学分|学时|周数|周次|校区|地点|场地|教室|教师|老师|任课教师|授课教师|备注|组成|打印|学号|姓名|学期|学年|课表)/;
+
+  // 强隔离墙：字段标签（可带冒号）是硬边界，标签之后的内容绝不参与课名
+  var FIELD_WALL = /(?:周数|周次|教师|老师|任课教师|授课教师|地点|场地|教室|上课地点|上课教室|校区|教学班组成|教学班|学分|周学时|总学时|学时|考核方式|选课备注|课程代码|课程学时组成)\s*[:：]?/g;
+
+  // 判断一段文字“像不像课程名”
+  function isPlausibleName(s) {
+    var t = String(s || "").replace(/^[\s\-—·、,，.。:：]+|[\s\-—·、,，.。:：]+$/g, "").trim();
+    if (t.length < 2 || t.length > 40) return false;
+    if (!hasCJK(t)) return false;
+    if (/[;；\\/\\\\|]/.test(t)) return false;                 // 分隔符残留
+    if (/\d+\s*周/.test(t)) return false;                     // 周次残余
+    if (/^(无|有|暂无|未知|同上|见备注|课程|教师|地点|周数|学时|学分|考核|备注|说明|理论|实践|上午|下午|晚上)$/.test(t)) return false;
+    if (/^[)）\]】]/.test(t)) return false;                    // 以右括号开头
+    if (/[)）\]】]$/.test(t) && !/[（(\[【]/.test(t)) return false;
+    if (/^[\d\s\-—·、,，.。]+$/.test(t)) return false;
+    if (LABEL_WORDS.test(t)) return false;
+    if (/(楼|馆|场|室|校区|操场|实验室)$/.test(t) && t.length <= 8) return false;
+    return true;
+  }
+
+  function cleanNamePiece(seg) {
+    var s = String(seg || "");
+    s = s.replace(/其他(?:课程|列表|项目)\s*[:：]?/, " ");
+    s = s.replace(/^\d{1,2}\s+(?=[\u4e00-\u9fa5A-Za-z])/, "");
+    s = s.split("/")[0];
+    s = s
+      .replace(/\(?\s*(?:第)?\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*\)?\s*节\s*\)?/g, " ")
+      .replace(/(?:第)?\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*周\s*(?:\(?\s*[单双]\s*\)?)?/g, " ")
+      .replace(/^\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*(?=[\u4e00-\u9fa5A-Za-z])/, " ")
+      .replace(SYMBOL_RE, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return s.replace(/^[\s\-—·、,，.。:：]+|[\s\-—·、,，.。:：]+$/g, "").trim();
+  }
+
+  // 把“标签+值”整体抹掉（值到下一个 / 为止）；无冒号也抹，防止值残片当课名
+  var FIELD_STRIP = /(?:周数|周次|教师|老师|任课教师|授课教师|地点|场地|教室|上课地点|上课教室|校区|教学班组成|教学班|学分|周学时|总学时|学时|考核方式|选课备注|课程代码|课程学时组成)\s*[:：]?\s*[^/]*/g;
+
+  function stripToNameResidue(text) {
+    return tighten(text)
+      .replace(/其他(?:课程|列表|项目)\s*[:：]?/g, " ")
+      .replace(FIELD_STRIP, " ")
+      .replace(/\(?\s*(?:第)?\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*\)?\s*节\s*\)?/g, " ")
+      .replace(/(?:第)?\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*周\s*(?:\(?\s*[单双]\s*\)?)?/g, " ")
+      .replace(/^\s*\d{1,2}\s*[-–—~至]\s*\d{1,2}\s*(?=[\u4e00-\u9fa5A-Za-z])/, " ")
+      .replace(SYMBOL_RE, " ")
+      .replace(/[：:]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function nameCandidates(text) {
+    var residue = stripToNameResidue(text);
+    var strong = residue.split(/[\/|;；,，]+/).map(function (x) {
+      return x.replace(/^[\s\-—·、,，.。:：()（）\[\]【】]+|[\s\-—·、,，.。:：]+$/g, "").trim();
+    }).filter(function (x) {
+      return x && isPlausibleName(x);
+    });
+
+    var weak = [], m;
+    var reWeak = /(?:教学班组成|教学班)\s*[:：]\s*([^/]+)/g;
+    while ((m = reWeak.exec(tighten(text))) !== null) {
+      var v = m[1].split(/[\/|;；,，]/)[0].replace(/[-_]\d{2,4}$/, "").trim();
+      if (isPlausibleName(v)) weak.push(v);
+    }
+    strong = strong.map(function (x) {
+      if (!/[（(]/.test(x)) x = x.replace(/[)）]+\s*$/, "").trim();
+      return x;
+    }).filter(isPlausibleName);
+    return { strong: strong, weak: weak };
+  }
+
+  // 以“节次 token”为界，把某一列（某一天）的文本流切成课程段。
+  // 名字只从节次 token 之前的行里取，token 之后全是这门课的详情。
+  function segmentByPeriods(lines) {
+    var blocks = [], cur = null, pending = [];
+
+    function takeName(extraBefore) {
+      // 节次之前的连续“非字段”行，拼成课名（可能被换行拆成多行）
+      var pool = pending.slice();
+      if (extraBefore) pool.push(extraBefore);
+      // 从下往上找第一段“像课名”的行；连续的纯名字行（换行拆开的课名）再往上合并
+      for (var i = pool.length - 1; i >= 0; i--) {
+        var x = pool[i];
+        if (hasFieldLabel(x) || /^[:：;；\/]/.test(x)) continue;
+        var cand = cleanNamePiece(x);
+        if (!isPlausibleName(cand)) continue;
+        if (i > 0) {
+          var prev = cleanNamePiece(pool[i - 1]);
+          // 上一行也是短名字且不带标点 → 认为是同一个课名被换行拆开
+          if (isPlausibleName(prev) && !/[：:；;（）()]/.test(prev) && prev.length <= 12) {
+            return (prev + cand);
           }
+        }
+        return cand;
+      }
+      return "";
+    }
+
+    lines.forEach(function (ln) {
+      var t = tighten(ln.text);
+      if (!t) return;
+      var ps = periodsIn(t);
+      if (!ps.length) {
+        if (cur) cur.parts.push(t);
+        else pending.push(t);
+        return;
+      }
+      var idx = ps[0].index;
+      var rawLen = ps[0].raw.length;
+      var before = t.slice(0, idx).trim();
+      var after = t.slice(idx + rawLen).trim();
+
+      var nameSource = takeName(before);
+      cur = { parts: [], nameSource: nameSource, hasPeriod: true };
+      cur.parts.push(t);          // 整行保留（节次 token 是“边界”但也要留在文本里供字段抽取）
+      blocks.push(cur);
+      pending = [];
+    });
+
+    // 只有名字、没有节次的尾巴（可能是“其他课程”或页脚）→ 不产生课程
+    return blocks.map(function (b) {
+      b.text = tighten([b.nameSource].concat(b.parts).join(" "));
+      return b;
+    }).filter(function (b) { return b.text; });
+  }
+
+  function deriveName(text) {
+    var c = nameCandidates(text);
+    if (c.strong.length) {
+      var best = c.strong[0];
+      c.strong.forEach(function (x) {
+        var score = x.length <= 14 ? 2 : 1;
+        var bestScore = best.length <= 14 ? 2 : 1;
+        if (score > bestScore) best = x;
+      });
+      return best;
+    }
+    return c.weak[0] || "";
+  }
+
+  function buildCourseFromBlock(block) {
+    var text = tighten(block.parts.join(" "));
+    var weeks = weeksFromText(text);
+    var periods = periodsIn(text);
+    var teacher = pickField(text, ["教师", "老师", "任课教师", "授课教师"]);
+    var location = pickField(text, ["地点", "场地", "教室", "上课地点", "上课教室"]);
+    if (/^(无|暂无|无;|未知)$/.test(teacher)) teacher = "";
+    if (/^(无|暂无|无;|未知)$/.test(location)) location = "";
+    var name = deriveName(text);
+    if (!isPlausibleName(name)) return null;
+
+    var wk = canonicalWeeks(weeks);
+    var course = {
+      name: name, teacher: teacher, location: location,
+      weeks: wk.text, week_list: wk.list
+    };
+    if (periods.length) {
+      course.start_period = periods[0].start;
+      course.end_period = periods[0].end;
+    }
+    return course;
+  }
+
+  // “其他课程：美学关煜(共18周)/1-18周/无; 剧作呈现张翼(共2周)/4-5周/无;”
+  function parseOtherCourses(text) {
+    var t = String(text || "").replace(/^.*?其他课程\s*[:：]\s*/, "");
+    var out = [];
+    t.split(/[;；]+/).forEach(function (chunk) {
+      chunk = chunk.trim();
+      if (!chunk) return;
+      var parts = chunk.split("/");
+      var name = (parts[0] || "")
+        .replace(/[（(][^）)]*[)）]/g, "")
+        .replace(/[:：\s]+/g, "")
+        .trim();
+      if (!name || !/[\u4e00-\u9fa5]/.test(name) || name.length < 2) return;
+      var weeks = (parts[1] || "").trim();
+      var w = canonicalWeeks(primaryWeekTokens(weekTokens(weeks)));
+      out.push({
+        name: name,
+        weeks: w.text || weeks,
+        week_list: w.list,
+        teacher: "",
+        location: ""
+      });
+    });
+    return out;
+  }
+
+  /* ---------- 主解析 ---------- */
+  function parsePages(pages) {
+    var lineCache = pages.map(function (pg) { return buildLines(pg.items); });
+    var layoutTags = [];
+
+    // 1) 表头（一行里 ≥3 个“星期X”）
+    var header = null, headerPage = -1;
+    for (var p = 0; p < pages.length; p++) {
+      var h = findHeaderAnchor(lineCache[p]);
+      if (h) { header = h; headerPage = p; layoutTags.push("表头分列"); break; }
+    }
+
+    var columnSet = null, mode = "stream";
+    if (header) {
+      mode = "table";
+      columnSet = [];
+      for (var i = 0; i < header.anchors.length; i++) {
+        var a = header.anchors[i];
+        columnSet.push({
+          day: a.day,
+          left: i === 0 ? -Infinity : (header.anchors[i - 1].x + a.x) / 2,
+          right: i === header.anchors.length - 1 ? Infinity : (a.x + header.anchors[i + 1].x) / 2
         });
-        Object.keys(groups).forEach(function (dayKey) {
-          var text = groups[dayKey].sort(function (a, b2) { return a.x - b2.x; })
-            .map(function (it) { return it.s; }).join("");
-          (columns[dayKey] = columns[dayKey] || []).push({ page: pageIndex, y: row.y, text: text });
+      }
+    }
+
+    // 2) 散落的“星期X”（分节符）
+    var dayLabels = header ? null : findDayLabels(lineCache[0]);
+    if (!header && dayLabels) {
+      mode = "sections";
+      dayLabels.sort(function (x, y) { return y.y - x.y; }); // 自上而下
+      layoutTags.push("星期分节");
+    }
+
+    // 3) 都没有 → 空白缝推断列
+    if (!header && !dayLabels) {
+      var cols = inferColumns(pages[0].items, pages[0].width);
+      if (cols) {
+        mode = "inferred";
+        layoutTags.push("坐标聚列");
+        columnSet = columnBounds(cols).map(function (b, idx) {
+          return { day: idx + 1, left: b.left, right: b.right };
         });
+      } else {
+        layoutTags.push("单列文本流");
+      }
+    }
+
+    var buckets = {};
+
+    var extraCourses = [];
+
+    pages.forEach(function (pg, pi) {
+      var lines = lineCache[pi];
+      var currentDay = 0;
+
+      // 预扫描：把“其他课程…/…/无;”这种跨行整段抽出来，避免混进课表单元
+      var skip = {};
+      for (var li = 0; li < lines.length; li++) {
+        var lt = tighten(lines[li].text);
+        if (lt.indexOf("其他课程") < 0) continue;
+        var buf = lt, k = li;
+        while (k + 1 < lines.length && k - li < 8) {
+          var nxt = tighten(lines[k + 1].text);
+          if (!nxt) break;
+          if (nxt.indexOf("打印时间") >= 0 || /^[:：]/.test(nxt)) break;   // 到页脚为止
+          k++;
+          buf += nxt;
+        }
+        parseOtherCourses(buf).forEach(function (x) { extraCourses.push(x); });
+        for (var z = li; z <= k; z++) skip[z] = 1;
+        li = k;
+      }
+
+      lines.forEach(function (ln, lnIdx) {
+        if (skip[lnIdx]) return;
+        if (header && pi === headerPage && ln === header.line) return;
+
+        var raw = tighten(ln.text);
+        if (!raw) return;
+
+        // 行内可能带“星期X”前缀（例如 “星期二 3-4 保险学概论…”）
+        var inline = raw.match(/^(?:星期|周|礼拜)([一二三四五六日天])\s*/);
+        if (inline) {
+          if (mode === "sections") currentDay = DAY_CHARS[inline[1]];
+          raw = raw.slice(inline[0].length);
+          if (!raw) return;
+        }
+
+        // 纯标签行
+        if (ln.items.length === 1 && isDayLabel(ln.text)) return;
+
+        if (mode === "table" || mode === "inferred") {
+          var groups = {};
+          ln.items.forEach(function (it) {
+            var cx = it.x;
+            for (var c = 0; c < columnSet.length; c++) {
+              if (cx >= columnSet[c].left && cx < columnSet[c].right) {
+                (groups[columnSet[c].day] = groups[columnSet[c].day] || []).push(it);
+                return;
+              }
+            }
+          });
+          Object.keys(groups).forEach(function (dayKey) {
+            var text = tighten(groups[dayKey].sort(function (a, b) { return a.x - b.x; })
+              .map(function (it) { return it.s; }).join(" "));
+            (buckets[dayKey] = buckets[dayKey] || []).push({ y: ln.y, text: text });
+          });
+          return;
+        }
+
+        if (mode === "sections") {
+          // 归到“纵向距离最近”的星期标签（这类排版里标签常位于分区左侧中部），
+          // 距离过远时退回“上方最近的标签”，避免丢失课程
+          var best = null, bestD = Infinity;
+          dayLabels.forEach(function (lb) {
+            var d = Math.abs(lb.y - ln.y);
+            if (d < bestD) { bestD = d; best = lb; }
+          });
+          var daySel = (best && bestD <= 85) ? best.day : currentDay;
+          if (!daySel) return;
+          (buckets[daySel] = buckets[daySel] || []).push({ y: ln.y, text: raw });
+          return;
+        }
+
+        (buckets[0] = buckets[0] || []).push({ y: ln.y, text: raw });
       });
     });
 
-    var courses = [];
-    Object.keys(columns).forEach(function (dayKey) {
+    var allCourses = [], extras = [];
+    Object.keys(buckets).forEach(function (dayKey) {
       var day = parseInt(dayKey, 10);
-      var lines = columns[dayKey].slice().sort(function (a, b) {
-        return (a.page - b.page) || (b.y - a.y);
+      var rows = buckets[dayKey].slice().sort(function (a, b) { return b.y - a.y; });
+      var blocks = segmentByPeriods(rows).map(function (b) {
+        return { parts: [b.text], hasPeriod: true };
       });
-      var cells = [], cur = null;
-      lines.forEach(function (line) {
-        var text = line.text.replace(/\s+/g, "");
-        if (!text) return;
-        if (SYMBOL_RE.test(text)) {           // 有 ◆ → 新的一门课
-          cur = { text: text };
-          cells.push(cur);
-        } else if (cur) {
-          cur.text += text;                   // 其余是这门课的详情
+      blocks.forEach(function (b) {
+        var course = buildCourseFromBlock(b);
+        if (!course) return;
+        if (course.start_period && day >= 1 && day <= 7) {
+          course.day = day;
+          allCourses.push(course);
+        } else if (course.weeks || course.teacher || course.location) {
+          // 无节次 → “其他课程”
+          extras.push({
+            name: course.name, teacher: course.teacher,
+            location: course.location, weeks: course.weeks, week_list: course.week_list
+          });
         }
       });
-      cells.forEach(function (cell) {
-        var parsed = cell.text.match(/^([^★☆○●◇◆◎]{1,80})[★☆○●◇◆◎]([\s\S]*)$/);
-        if (!parsed) return;
-        var detail = parsed[2] || "";
-        var course = buildCourse({
-          name: cleanName(parsed[1]), day: day, periods: periodsFromText(detail),
-          weeks: (detail.match(WEEK_RE) || [])[1] || "",
-          location: pickField(detail, ["场地", "地点", "教室"]),
-          teacher: pickField(detail, ["教师", "老师"])
-        });
-        if (course) courses.push(course);
-      });
     });
-    return { courses: courses, meta: collectMeta(pages) };
+
+    extras = extras.concat(extraCourses);
+    return { courses: allCourses, extras: extras, mode: mode };
+  }
+
+  function collectMeta(pages) {
+    var text = "";
+    pages.forEach(function (pg) {
+      pg.items.forEach(function (it) { text += it.s; });
+    });
+    var meta = {};
+    var sem = text.match(/(\d{4})\s*[-–—]\s*(\d{4})\s*学年\s*第?\s*([一二三1-3])\s*学期/);
+    if (sem) meta.semester = sem[1] + "-" + sem[2] + " 学年 第 " + sem[3] + " 学期";
+    var sid = text.match(/学号\s*[:：]?\s*(\d{6,14})/);
+    if (sid) meta.student_id = sid[1];
+    var who = text.match(/([\u4e00-\u9fa5]{2,4})\s*的?课表/);
+    if (who && !/^(我的|学生|个人)$/.test(who[1])) meta.student_name = who[1];
+    return meta;
+  }
+
+  /* ================= 策略 A/B：结构化解析（表格版 / 列表版） =================
+   * 按“版面族”识别，而不是按文件：有表头走表格算法，有星期分节走列表算法。
+   * 它们与通用引擎一起参与评分，谁解析得好就用谁（多策略集成）。
+   */
+  var OldLayout = (function () {
+    var DAY_MAP = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7 };
+      var SYMBOL_RE = /[★☆○●◇◆◎]/;
+      var WEEK_RE = /(\d{1,2}-\d{1,2}周(?:[(（][单双][)）])?)/;
+
+      function clean(v) {
+        return String(v == null ? "" : v)
+          .replace(/[\u200b-\u200f\ufeff]/g, "")
+          .replace(/\u00a0/g, " ")
+          .replace(/[ \t]+/g, " ")
+          .trim();
+      }
+
+      function isNoise(text) {
+        if (!text) return true;
+        if (text.indexOf("打印时间") >= 0) return true;
+        if (/^[★☆○●◇◆◎][:：]/.test(text)) return true;
+        return false;
+      }
+
+      function parseWeeks(text) {
+        if (!text) return [];
+        var raw = String(text).replace(/第/g, "").replace(/周/g, "");
+        var weeks = [], seen = {};
+        raw.split(/[,，、;；\/]+/).forEach(function (seg) {
+          seg = seg.trim();
+          if (!seg) return;
+          var odd = seg.indexOf("单") >= 0, even = seg.indexOf("双") >= 0;
+          var digits = seg.replace(/[^0-9\-~—]/g, "");
+          var m = digits.match(/^(\d+)(?:[-~—](\d+))?$/);
+          if (!m) return;
+          var a = parseInt(m[1], 10), b = parseInt(m[2] || m[1], 10);
+          if (b < a) { var t = a; a = b; b = t; }
+          for (var w = a; w <= b; w++) {
+            if (odd && w % 2 === 0) continue;
+            if (even && w % 2 === 1) continue;
+            if (!seen[w]) { seen[w] = 1; weeks.push(w); }
+          }
+        });
+        return weeks.sort(function (x, y) { return x - y; });
+      }
+
+      function clusterRows(items, tol) {
+        tol = tol || 6;
+        var sorted = items.slice().sort(function (a, b) { return (b.y - a.y) || (a.x - b.x); });
+        var rows = [], cur = null;
+        sorted.forEach(function (it) {
+          if (!cur || Math.abs(cur.y - it.y) > tol) {
+            cur = { y: it.y, items: [it] };
+            rows.push(cur);
+          } else {
+            cur.items.push(it);
+            cur.y = (cur.y * cur.items.length + it.y) / (cur.items.length + 1);
+          }
+        });
+        rows.forEach(function (r) {
+          r.items.sort(function (a, b) { return (a.x - b.x) || (b.y - a.y); });
+          r.text = r.items.map(function (it) { return it.s; }).join("");
+        });
+        return rows;
+      }
+
+      function pickField(text, names) {
+        for (var i = 0; i < names.length; i++) {
+          var m = text.match(new RegExp("(?:" + names[i] + ")[:：]\\s*([^/]*)"));
+          if (m && m[1]) return clean(m[1]).replace(/[:：]$/, "");
+        }
+        return "";
+      }
+
+      function periodsFromText(text) {
+        var m = text.match(/\((\d{1,2})-(\d{1,2})节\)/);
+        return m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : null;
+      }
+
+      function buildCourse(raw) {
+        var weeks = clean(raw.weeks || "");
+        var p = raw.periods || [raw.start, raw.end];
+        var start = parseInt(p[0], 10) || 0, end = parseInt(p[1], 10) || start;
+        var name = cleanName(raw.name || "");
+        if (!name || !start || !end) return null;
+        if (name.length > 24 || /[\/:：]/.test(name)) return null;
+        return {
+          rawText: raw.rawText || "",
+          name: name, teacher: clean(raw.teacher || ""), location: clean(raw.location || ""),
+          day: raw.day, start_period: start, end_period: end,
+          periods: start + "-" + end, weeks: weeks, week_list: parseWeeks(weeks)
+        };
+      }
+
+      function collectMeta(pages) {
+        var meta = {}, text = "";
+        pages.forEach(function (pg) { pg.items.forEach(function (it) { text += it.s; }); });
+        var sem = text.match(/(\d{4}-\d{4})学年第(\S{1,2})学期/);
+        if (sem) meta.semester = sem[1] + " 学年 第 " + sem[2] + " 学期";
+        var sid = text.match(/学号[:：](\d+)/);
+        if (sid) meta.student_id = sid[1];
+        var who = text.match(/^([^\s:：]{1,10})课表/);
+        if (who) meta.student_name = who[1];
+        return meta;
+      }
+
+      /* ---------- 字段清洗 ---------- */
+      function cleanName(text) {
+        var s = String(text || "");
+        var slash = s.lastIndexOf("/");
+        if (slash >= 0) s = s.slice(slash + 1);
+        s = s.replace(/^.*?(?:学分|总学时|周学时|学时|考核方式|选课备注|教学班组成)[:：][0-9.]*/, "");
+        s = s.replace(/^[0-9\-]+\s*/, "").replace(/^[:：\s]+/, "").trim();
+        return s;
+      }
+
+      /* ---------- A. 列表版：按“最近的星期表头”分块 ---------- */
+      function parseList(pages) {
+        var courses = [];
+        pages.forEach(function (pg) {
+          var headers = [];
+          pg.items.forEach(function (it) {
+            var t = it.s.replace(/\s+/g, "");
+            var m = t.match(/^星期([一二三四五六日天])$/);
+            if (m) headers.push({ day: DAY_MAP[m[1]], y: it.y });
+          });
+          if (!headers.length) return;
+          headers.sort(function (a, b) { return a.y - b.y; });
+
+          var buckets = headers.map(function (h) { return { day: h.day, y: h.y, items: [] }; });
+          pg.items.forEach(function (it) {
+            if (/^星期[一二三四五六日天]$/.test(it.s.replace(/\s+/g, ""))) return;
+            if (isNoise(it.s)) return;
+            var best = null, bestD = Infinity;
+            buckets.forEach(function (b) {
+              var d = Math.abs(b.y - it.y);
+              if (d < bestD) { bestD = d; best = b; }
+            });
+            if (best && bestD <= 85) best.items.push(it);
+          });
+
+          buckets.forEach(function (bucket) {
+            if (!bucket.items.length) return;
+            var rows = clusterRows(bucket.items, 6);
+
+            // 节次行：可能独占一行（"9-10"），也可能与详情粘连（"3-4周数:…"）
+            var periodRows = [];
+            rows.forEach(function (r) {
+              var t = r.text.replace(/\s+/g, "");
+              var m = t.match(/^(\d{1,2})-(\d{1,2})/);
+              if (m) {
+                var s1 = parseInt(m[1], 10), e1 = parseInt(m[2], 10);
+                // 只认 1-2 ... 11-12 这种节次，别把 1-16周 当成节次
+                if (s1 >= 1 && e1 <= 12 && e1 > s1) {
+                  periodRows.push({ y: r.y, start: s1, end: e1 });
+                }
+              }
+            });
+
+            rows.forEach(function (r) {
+              var t = r.text.replace(/\s+/g, "");
+              var sym = t.search(SYMBOL_RE);
+              if (sym <= 0) return;
+
+              var head = t.slice(0, sym);
+              var tail = t.slice(sym + 1);
+              var periods = null;
+              var name = cleanName(head);
+
+              // 详情可能被拆到上下相邻的行（节次行夹在中间），补回来
+              if (!WEEK_RE.test(tail)) {
+                rows.forEach(function (r2) {
+                  if (r2 === r) return;
+                  if (Math.abs(r2.y - r.y) > 14) return;
+                  if (SYMBOL_RE.test(r2.text)) return;
+                  if (/^(\d{1,2})-(\d{1,2})$/.test(r2.text.replace(/\s+/g, ""))) return;
+                  tail += r2.text;
+                });
+              }
+
+              var lead = head.match(/^(\d{1,2})-(\d{1,2})(.*)$/);
+              if (lead) {
+                periods = [parseInt(lead[1], 10), parseInt(lead[2], 10)];
+                name = cleanName(lead[3]);
+              }
+              if (!periods) {
+                var near = null, nd = Infinity;
+                periodRows.forEach(function (p) {
+                  var d = Math.abs(p.y - r.y);
+                  if (d < nd) { nd = d; near = p; }
+                });
+                if (near && nd <= 40) periods = [near.start, near.end];
+              }
+              if (!periods) return;
+
+              var course = buildCourse({
+                rawText: head + " " + tail,
+                name: name, day: bucket.day, periods: periods,
+                weeks: (tail.match(/周数[:：]\s*([0-9\-~—]+周(?:[(（][单双][)）])?)/) || [])[1]
+                       || (tail.match(WEEK_RE) || [])[1] || "",
+                location: pickField(tail, ["地点", "场地", "教室"]),
+                teacher: pickField(tail, ["教师", "老师"])
+              });
+              if (course) courses.push(course);
+            });
+          });
+        });
+        return { courses: courses, meta: collectMeta(pages) };
+      }
+
+      /* ---------- B. 表格版：先按列切行，再把“名称行 + 后续详情行”拼成单元格 ---------- */
+      function findHeaderRow(pages) {
+        for (var p = 0; p < pages.length; p++) {
+          var rows = clusterRows(pages[p].items, 6);
+          for (var r = 0; r < rows.length; r++) {
+            var t = rows[r].text.replace(/\s+/g, "");
+            if (t.indexOf("节次") >= 0 && (t.match(/星期[一二三四五六日天]/g) || []).length >= 2) {
+              return { page: p, row: rows[r] };
+            }
+          }
+        }
+        return null;
+      }
+
+      function isTableLayout(pages) { return !!findHeaderRow(pages); }
+
+      function parseTable(pages) {
+        var header = findHeaderRow(pages);
+        if (!header) return null;
+
+        var days = [], periodItem = null;
+        header.row.items.forEach(function (it) {
+          var m = it.s.match(/星期([一二三四五六日天])/);
+          if (m) days.push({ day: DAY_MAP[m[1]], x: it.x });
+          if (!periodItem && it.s.indexOf("节次") >= 0) periodItem = it;
+        });
+        if (days.length < 5) return null;
+        days.sort(function (a, b) { return a.x - b.x; });
+
+        var periodX = periodItem ? periodItem.x : days[0].x - 80;
+        var bounds = days.map(function (d, idx) {
+          var left = idx === 0 ? (periodX + d.x) / 2 : (days[idx - 1].x + d.x) / 2;
+          var right = idx === days.length - 1 ? Infinity : (d.x + days[idx + 1].x) / 2;
+          return { day: d.day, left: left, right: right };
+        });
+
+        var columns = {};
+        pages.forEach(function (pg, pageIndex) {
+          clusterRows(pg.items, 6).forEach(function (row) {
+            // 表头及其上方（标题、姓名）不参与
+            if (pageIndex === header.page && row.y >= header.row.y - 1) return;
+            var groups = {};
+            row.items.forEach(function (it) {
+              if (isNoise(it.s)) return;
+              var cx = it.x + (it.w || 0) / 2;
+              for (var b = 0; b < bounds.length; b++) {
+                if (cx >= bounds[b].left && cx < bounds[b].right) {
+                  (groups[bounds[b].day] = groups[bounds[b].day] || []).push(it);
+                  break;
+                }
+              }
+            });
+            Object.keys(groups).forEach(function (dayKey) {
+              var text = groups[dayKey].sort(function (a, b2) { return a.x - b2.x; })
+                .map(function (it) { return it.s; }).join("");
+              (columns[dayKey] = columns[dayKey] || []).push({ page: pageIndex, y: row.y, text: text });
+            });
+          });
+        });
+
+        var courses = [];
+        Object.keys(columns).forEach(function (dayKey) {
+          var day = parseInt(dayKey, 10);
+          var lines = columns[dayKey].slice().sort(function (a, b) {
+            return (a.page - b.page) || (b.y - a.y);
+          });
+          var cells = [], cur = null;
+          lines.forEach(function (line) {
+            var text = line.text.replace(/\s+/g, "");
+            if (!text) return;
+            if (SYMBOL_RE.test(text)) {           // 有 ◆ → 新的一门课
+              cur = { text: text };
+              cells.push(cur);
+            } else if (cur) {
+              cur.text += text;                   // 其余是这门课的详情
+            }
+          });
+          cells.forEach(function (cell) {
+            var parsed = cell.text.match(/^([^★☆○●◇◆◎]{1,80})[★☆○●◇◆◎]([\s\S]*)$/);
+            if (!parsed) return;
+            var detail = parsed[2] || "";
+            var course = buildCourse({
+              rawText: cell.text,
+              name: cleanName(parsed[1]), day: day, periods: periodsFromText(detail),
+              weeks: (detail.match(WEEK_RE) || [])[1] || "",
+              location: pickField(detail, ["场地", "地点", "教室"]),
+              teacher: pickField(detail, ["教师", "老师"])
+            });
+            if (course) courses.push(course);
+          });
+        });
+        return { courses: courses, meta: collectMeta(pages) };
+      }
+
+    return { parseList: parseList, parseTable: parseTable, isTableLayout: isTableLayout };
+  })();
+
+  /* ================= 入口 ================= */
+  function scoreResult(r) {
+    var cs = (r && r.courses) || [];
+    var score = cs.length ? cs.length * 10 : -100, seen = {}, dup = 0;
+    cs.forEach(function (c) {
+      if (c.weeks) score += 3;
+      if (c.location) score += 2;
+      if (c.teacher) score += 1;
+      if ((c.name || "").length > 20) score -= 6;
+      if (/^\d+$/.test(c.name || "")) score -= 10;
+      var k = [c.name, c.day, c.start_period, c.end_period].join("|");
+      if (seen[k]) dup++; else seen[k] = 1;
+    });
+    return score - dup * 8;
+  }
+
+  // 策略只负责“定位”（星期/节次），字段一律用统一的抽取器重算，
+  // 避免结构化解析器的 cleanName / 首个周次正则把名字截断、周次截半
+  function canonicalCourse(c) {
+    if (!c || !c.rawText) return c;
+    var text = tighten(c.rawText);
+
+    var name = deriveName(text);
+    if (isPlausibleName(name)) c.name = name;
+
+    var toks = weeksFromText(text);
+    var wk = canonicalWeeks(toks);
+    if (wk.list.length) { c.weeks = wk.text; c.week_list = wk.list; }
+
+    var loc = pickField(text, ["地点", "场地", "教室", "上课地点", "上课教室"]);
+    if (loc) c.location = loc;
+    var tea = pickField(text, ["教师", "老师", "任课教师", "授课教师"]);
+    if (tea) c.teacher = tea;
+    delete c.rawText;
+    return c;
+  }
+
+  function normalizeResult(r) {
+    return ((r && r.courses) || []).filter(function (c) {
+      return c && c.name && c.name.length >= 2 &&
+        c.day >= 1 && c.day <= 7 && c.start_period;
+    });
+  }
+
+  // 同一页跑多种版面策略，按“课程数 + 字段完整度 − 重复/垃圾”评分择优
+  function pickBest(pages) {
+    var cands = [];
+    try {
+      if (OldLayout.isTableLayout(pages)) {
+        var t = OldLayout.parseTable(pages);
+        if (t && (t.courses || []).length) cands.push({ tag: "表格版", r: t, bonus: 60 });
+      }
+    } catch (e) {}
+    try {
+      var l = OldLayout.parseList(pages);
+      if (l && (l.courses || []).length) cands.push({ tag: "列表版", r: l, bonus: 40 });
+    } catch (e) {}
+    var g = null;
+    try {
+      g = parsePages(pages);
+      cands.push({ tag: "通用引擎", r: g, bonus: 0 });
+    } catch (e) {}
+
+    var best = null, bestScore = -1;
+    cands.forEach(function (c) {
+      c.r.courses = normalizeResult(c.r);
+      c.score = scoreResult(c.r) + (c.bonus || 0);
+      if (c.score > bestScore) { bestScore = c.score; best = c; }
+    });
+    return { best: best, generic: g };
   }
 
   async function parseFiles(fileList) {
@@ -1006,49 +1798,163 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
     if (!files.length) throw new Error("没有可解析的 PDF 文件");
     if (!initPdfEngine()) throw new Error("PDF 引擎未就绪");
 
-    var all = [], meta = {}, layouts = [];
+    var courses = [], extras = [], meta = {}, modes = [];
+
     for (var i = 0; i < files.length; i++) {
       var pages = await extractPages(files[i]);
-      var parsed = null;
-      if (isTableLayout(pages)) {
-        parsed = parseTable(pages);
-        if (parsed && parsed.courses.length) layouts.push("表格版");
+      var picked = pickBest(pages);
+      if (picked.best) {
+        courses = courses.concat(picked.best.r.courses);
+        modes.push(picked.best.tag);
       }
-      if (!parsed || !parsed.courses.length) {
-        parsed = parseList(pages);
-        if (parsed && parsed.courses.length) layouts.push("列表版");
-      }
-      if (parsed) {
-        all = all.concat(parsed.courses);
-        Object.keys(parsed.meta || {}).forEach(function (k) {
-          if (!meta[k] && parsed.meta[k]) meta[k] = parsed.meta[k];
+      if (picked.generic) {
+        (picked.generic.extras || []).forEach(function (x) {
+          if (x.name && x.name.length >= 2) extras.push(x);
         });
       }
+      var m = collectMeta(pages);
+      Object.keys(m).forEach(function (k) { if (!meta[k]) meta[k] = m[k]; });
     }
 
-    var seen = {}, unique = [];
-    all.forEach(function (c) {
-      var key = [c.name, c.day, c.start_period, c.end_period, c.weeks, c.location].join("|");
-      if (seen[key]) return;
-      seen[key] = 1;
-      unique.push(c);
-    });
-    unique.sort(function (a, b) {
-      return (a.day - b.day) || (a.start_period - b.start_period) || a.name.localeCompare(b.name);
+    courses = courses.map(canonicalCourse);
+    // 课名首尾的斜杠/冒号/顿号一律清掉（不同策略可能留下残渣）
+    courses.forEach(function (c) {
+      c.name = String(c.name || "").replace(/^[\s\/:：·\-]+|[\s\/:：·\-]+$/g, "").trim();
     });
 
+    var seen = {};
+    courses = courses.filter(function (c) {
+      var key = [c.name, c.day, c.start_period, c.end_period, c.weeks, c.location].join("|");
+      if (seen[key]) return false;
+      seen[key] = 1;
+      return true;
+    });
+    courses.sort(function (a, b) {
+      return (a.day - b.day) || (a.start_period - b.start_period) ||
+        (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    });
+
+    var seenX = {};
+    extras = extras.filter(function (c) {
+      var key = [c.name, c.weeks, c.teacher].join("|");
+      if (seenX[key]) return false;
+      seenX[key] = 1;
+      return true;
+    });
+
+    if (!courses.length && !extras.length) {
+      throw new Error("没能在文件里识别出课程。请确认它是教务系统导出的课表 PDF（而不是截图/扫描件），或改用「导入 JSON」。");
+    }
+
     return {
-      courses: unique, meta: meta,
-      layouts: Array.from(new Set(layouts)), fileCount: files.length
+      courses: courses, extras: extras, meta: meta,
+      layouts: Array.from(new Set(modes)), fileCount: files.length
     };
   }
 
   global.PdfImport = {
     parseFiles: parseFiles,
-    parseWeeks: parseWeeks,
     ready: initPdfEngine,
-    _internal: { clusterRows: clusterRows, parseList: parseList, parseTable: parseTable,
-                findHeaderRow: findHeaderRow, extractPages: extractPages }
+    parseWeeks: function (text) {
+      return weekTokens(text).reduce(function (acc, w) { return acc.concat(w.weeks); }, [])
+        .sort(function (a, b) { return a - b; });
+    },
+    _internal: {
+      debug: function (pages) {
+        var lines = buildLines(pages[0].items);
+        var parsed = parsePages(pages);
+        return {
+          mode: parsed.mode,
+          lines: lines.map(function (l) { return { y: Math.round(l.y), x: Math.round(l.x), t: l.text }; }),
+          courses: parsed.courses.length,
+          extras: parsed.extras.length,
+          courseRows: parsed.courses.map(function (c) { return [c.day, c.name, c.start_period + "-" + c.end_period, c.weeks]; })
+        };
+      },
+      blocksOf: function (pages) {
+        var lines = buildLines(pages[0].items);
+        var labels = findDayLabels(lines) || [];
+        var byDay = {};
+        lines.forEach(function (ln) {
+          var raw = tighten(ln.text);
+          var inline = raw.match(/^(?:星期|周|礼拜)([一二三四五六日天])\s*/);
+          if (inline) raw = raw.slice(inline[0].length);
+          if (ln.items.length === 1 && isDayLabel(ln.text)) return;
+          var best = null, bestD = Infinity;
+          labels.forEach(function (lb) { var d = Math.abs(lb.y - ln.y); if (d < bestD) { bestD = d; best = lb; } });
+          if (!best || bestD > 85) return;
+          (byDay[best.day] = byDay[best.day] || []).push({ y: ln.y, text: raw });
+        });
+        var out = {};
+        Object.keys(byDay).forEach(function (d) {
+          var rows = byDay[d].sort(function (a, b) { return b.y - a.y; });
+          out[d] = rowsToBlocks(rows).map(function (b) {
+            return { text: b.parts.join(" | ").slice(0, 120), hasPeriod: b.hasPeriod };
+          });
+        });
+        return out;
+      },
+      // 供测试：直接喂 pages（合成用例）走完整的“多策略择优”流程
+      parseItems: function (pages) {
+        var picked = pickBest(pages);
+        var r = picked.best ? picked.best.r : { courses: [] };
+        var extras = (picked.generic && picked.generic.extras) || [];
+        return {
+          courses: r.courses || [],
+          extras: extras,
+          layouts: picked.best ? [picked.best.tag] : [],
+          mode: picked.best ? picked.best.tag : "none"
+        };
+      },
+      extractPages: extractPages,
+      buildLines: buildLines,
+      parsePages: parsePages,
+      weekTokens: weekTokens,
+      periodTokens: periodTokens,
+      deriveName: deriveName,
+      debugRows: function (rows) {
+        return rowsToBlocks(rows).map(function (b) {
+          return { text: b.parts.join(" | "), hasPeriod: b.hasPeriod };
+        });
+      },
+      debugBuckets: function (pages) {
+        var out = {};
+        var saved = parsePages;
+        // 复用主流程：在 parsePages 内部打点不方便，这里复制其“分配”逻辑的轻量版
+        var lineCache = pages.map(function (pg) { return buildLines(pg.items); });
+        var header = null;
+        for (var i = 0; i < lineCache.length; i++) {
+          var h = findHeaderAnchor(lineCache[i]);
+          if (h) { header = h; break; }
+        }
+        if (!header) return out;
+        var bounds = [];
+        for (var j = 0; j < header.anchors.length; j++) {
+          var a = header.anchors[j];
+          bounds.push({ day: a.day,
+            left: j === 0 ? -Infinity : (header.anchors[j-1].x + a.x) / 2,
+            right: j === header.anchors.length - 1 ? Infinity : (a.x + header.anchors[j+1].x) / 2 });
+        }
+        lineCache[0].forEach(function (ln) {
+          if (ln === header.line) return;
+          ln.items.forEach(function (it) {
+            for (var c = 0; c < bounds.length; c++) {
+              if (it.x >= bounds[c].left && it.x < bounds[c].right) {
+                (out[bounds[c].day] = out[bounds[c].day] || []).push(Math.round(ln.y) + ":" + it.x + ":" + it.s.slice(0, 16));
+                return;
+              }
+            }
+          });
+        });
+        return out;
+      },
+      debugName: function (t) {
+        var residue = stripToNameResidue(t);
+        var parts = residue.split(/[\/|;；,，]+/);
+        return { residue: residue, parts: parts, plausible: parts.map(isPlausibleName) };
+      },
+      inferColumns: inferColumns
+    }
   };
 })(window);
 
@@ -1067,7 +1973,7 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
 
   /* ---------------- 常量 ---------------- */
   var STORE_KEY = "schedule.app.v3";
-  var APP_VERSION = "3.1.3";
+  var APP_VERSION = "3.1.5";
   var DAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
   var DAY_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"];
   var DEFAULT_PERIODS = [
@@ -1108,7 +2014,7 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
     weekView: $("#weekView"), dayView: $("#dayView"), dayTabs: $("#dayTabs"), timeline: $("#timeline"),
     mask: $("#mask"), toast: $("#toast"),
     importSheet: $("#importSheet"), settingsSheet: $("#settingsSheet"), courseSheet: $("#courseSheet"),
-    boardHint: $("#boardHint"), daySummary: $("#daySummary"),
+    boardHint: $("#boardHint"), daySummary: $("#daySummary"), extrasBox: $("#extrasBox"),
     dialog: $("#dialog"), dlgTitle: $("#dlgTitle"), dlgText: $("#dlgText"), dlgField: $("#dlgField"),
     dlgInput: $("#dlgInput"), dlgOk: $("#dlgOk"), dlgCancel: $("#dlgCancel"),
     ttList: $("#ttList"), periodEditor: $("#periodEditor"), startDate: $("#startDate"),
@@ -1455,7 +2361,7 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
       el.timeline.style.height = "auto";
       el.timeline.innerHTML =
         '<div class="day-empty"><div class="big">🌤</div>' +
-        '<div class="t">' + DAY_NAMES[state.day - 1] + " 本周没有课</div>" +
+        '<div class="t">' + (state.day === todayIndex() ? "今天没有课" : "这一天没有课") + "</div>" +
         '<div class="s">第 ' + state.week + " 周 · 点上面日期换一天，<br>或回周视图看全周安排。</div>" +
         '<button class="btn ghost sm" id="btnBackWeek" style="max-width:150px">回到周视图</button></div>';
       return;
@@ -1528,6 +2434,37 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
   }
 
   // 只刷「课表区域 + 顶部」，不会重建设置面板，编辑时间时不丢焦点
+  function normalizeExtras(list) {
+    return (list || []).map(function (x) {
+      return {
+        name: String((x && x.name) || "").trim().slice(0, 40),
+        teacher: String((x && x.teacher) || "").trim(),
+        location: String((x && x.location) || "").trim(),
+        weeks: String((x && x.weeks) || "").trim(),
+        week_list: Array.isArray(x && x.week_list) ? x.week_list : []
+      };
+    }).filter(function (x) { return x.name; });
+  }
+
+  function renderExtras() {
+    if (!el.extrasBox) return;
+    var t = tt();
+    var list = (t && t.extras) || [];
+    if (state.view !== "week" || !list.length) {
+      el.extrasBox.hidden = true;
+      return;
+    }
+    el.extrasBox.hidden = false;
+    el.extrasBox.innerHTML =
+      '<div class="ex-head">📌 <b>其他课程</b>（无固定节次，共 ' + list.length + ' 门）</div>' +
+      list.map(function (x) {
+        return '<div class="ex-item"><span class="ex-name">' + esc(x.name) + "</span>" +
+          (x.weeks ? '<span class="ex-week">' + esc(x.weeks) + "</span>" : "") +
+          (x.teacher ? '<span class="ex-teacher">' + esc(x.teacher) + "</span>" : "") +
+          "</div>";
+      }).join("");
+  }
+
   function renderQuick() {
     if (!state.db) return;
     el.weekView.hidden = state.view !== "week";
@@ -1538,6 +2475,7 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
     renderChips();
     if (state.view === "week") renderWeekView();
     else { renderDayTabs(); renderDayView(); }
+    renderExtras();
   }
 
   function render() {
@@ -1709,11 +2647,18 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
     state.pending = result;
     var box = $("#importPreview");
     box.hidden = false;
-    $("#importCount").textContent = "共 " + result.courses.length + " 门 · " + (result.layouts.join(" / ") || sourceLabel);
+    var ex = result.extras || [];
+    $("#importCount").textContent = "共 " + result.courses.length + " 门" +
+      (ex.length ? " + " + ex.length + " 门其他课程" : "") +
+      " · " + (result.layouts.join(" / ") || sourceLabel);
     $("#parsedList").innerHTML = result.courses.map(function (c) {
       return '<div class="prow"><span class="d">' + DAY_NAMES[c.day - 1] + "</span>" +
         '<span class="n">' + esc(c.name) + " · " + esc(c.location || "") + "</span>" +
         '<span class="w">' + esc(c.weeks || "") + "</span></div>";
+    }).join("") + ex.map(function (x) {
+      return '<div class="prow"><span class="d">其他</span>' +
+        '<span class="n">' + esc(x.name) + "</span>" +
+        '<span class="w">' + esc(x.weeks || "") + "</span></div>";
     }).join("");
     box.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
@@ -1728,6 +2673,7 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
     var meta = r.meta || {};
     var old = t.meta || {};
     t.courses = coursesFromImport(r);
+    t.extras = normalizeExtras(r.extras);
     t.meta = {
       school: old.school || "",
       semester: meta.semester || old.semester || "",
@@ -1774,6 +2720,7 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
         student_name: meta.student_name || "",
         student_id: meta.student_id || ""
       }});
+      target.extras = normalizeExtras(r.extras);
       target.startDate = (tt() && tt().startDate) || "";
       state.db.timetables.push(target);
       state.db.activeId = target.id;
@@ -2252,10 +3199,17 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
       toast("正在解析 PDF…");
       try {
         var result = await window.PdfImport.parseFiles(files);
-        if (!result.courses.length) throw new Error("没有识别到课程，请确认是教务系统导出的课表 PDF");
+        if (!result.courses.length && !(result.extras || []).length) {
+          throw new Error("没有识别到课程");
+        }
         showPreview(result, "PDF");
       } catch (err) {
-        toast("解析失败：" + (err.message || err), "err");
+        var msg = (err && err.message) ? err.message : String(err);
+        await dialog({
+          title: "这份 PDF 没能自动识别",
+          text: msg + "\n\n可以试试：\n· 确认是教务系统「导出/打印」的 PDF，而不是截图\n· 改用「导入 JSON」\n· 或者手动添加课程"
+        });
+        openSheet(el.importSheet);
       } finally {
         e.target.value = "";
       }
@@ -2537,27 +3491,6 @@ window.__PDFJS_CMAPS__={"Adobe-GB1-0": "AuBSQ29weXJpZ2h0IDE5OTAtMjAwOSBBZG9iZSBT
   }
 })();
 
-</script>
-
-<script>
-/* 原生壳桥接：返回键先关面板，再退出 */
-(function () {
-  function bind() {
-    var Cap = window.Capacitor;
-    if (!Cap || !Cap.Plugins || !Cap.Plugins.App) return false;
-    try {
-      Cap.Plugins.App.addListener("backButton", function () {
-        var dlg = document.querySelector(".dialog.on");
-        if (dlg) { var c = document.getElementById("dlgCancel"); if (c) c.click(); return; }
-        var sheet = document.querySelector(".sheet.on");
-        if (sheet) { var x = sheet.querySelector("[data-close]"); if (x) x.click(); return; }
-        Cap.Plugins.App.exitApp();
-      });
-    } catch (e) {}
-    return true;
-  }
-  if (!bind()) document.addEventListener("DOMContentLoaded", bind);
-})();
 </script>
 </body>
 </html>

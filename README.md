@@ -39,7 +39,7 @@ Android 端用系统 WebView 承载，界面基于**单文件 HTML**（CSS/JS/PD
 
 ## 下载与安装
 
-APK 请到本仓库的 **[Releases](../../releases)** 页面下载最新版本（例如 `我的课表-v3.1.3.apk`）。
+APK 请到本仓库的 **[Releases](../../releases)** 页面下载最新版本（例如 `我的课表-v3.1.8.apk`）。
 
 安装步骤：
 
